@@ -12,10 +12,11 @@ Python 3. Requires nothing extra; `liblz4` is used if present.
 python ./dt_song_mgmt.py project.dt2prj
 ```
 
-Writes 16 files to `./SONGS_<stem>/`:
+Writes 16 files to `./SONGS_<stem>/`, plus a setlist page:
 
 ```
 00_<name>.bin ... 15_<name>.bin
+songs.html
 ```
 
 ## Restore

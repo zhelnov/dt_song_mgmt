@@ -7,7 +7,8 @@ bytes each), and recompresses on restore so the device can import the file.
 
 Dump:
   python ./dt_song_mgmt.py project.dt2prj
-  → ./SONGS_<stem>/00_<name>.bin … 15_<name>.bin  (16 × 3072-byte slots)
+    → ./SONGS_<stem>/00_<name>.bin … 15_<name>.bin  (16 × 3072-byte slots)
+    → ./SONGS_<stem>/songs.html  (rows, mute maps)
 
 Restore (overwrites the .dt2prj; writes a .bak first):
     python ./dt_song_mgmt.py project.dt2prj ./SONGS_<stem>
@@ -28,6 +29,8 @@ import shutil
 import struct
 import sys
 import zipfile
+import zlib
+from html import escape
 from pathlib import Path
 
 MAGIC_TAIL = bytes.fromhex("bacef00c")
@@ -45,6 +48,42 @@ UNCOMP_SIZE_OFF = 25  # u32be uncompressed project size in the 31-byte head
 # +Drive / Transfer project title: 13 bytes, NUL-terminated, '~'-padded.
 PROJECT_NAME_LEN = 13
 SONG_NAME_LEN = 16
+# Song-mode layout (SPEC.md §8): 4-byte header, 16-byte name, rows at +0x14.
+# Name at +0x04 ends where the row array begins (0x04 + 16 = 0x14).
+SONG_NAME_OFF = 4
+SONG_ROW_OFF = 0x14
+SONG_ROW_SIZE = 0x1D  # 29
+SONG_ROW_MAX = 99
+SONG_ROW_COUNT_OFF = 0x0B4B  # u16be active row count (SPEC.md §8)
+SONG_TEMPO_OFF = 0x0B50  # u16be leftover / default tempo (raw = BPM * 120)
+SONG_TRACKS = 16
+BPM_SCALE = 120  # raw = BPM * 120
+# Song-edit LABEL (row byte 1). 0 = pattern name (16 bytes at pattern+0x15AA4).
+# 1–8 are the factory song-edit keywords (manual screenshot: INTRO, VERSE,
+# BRIDGE, CHORUS, then BREAK, FILL, PRE, CH2). 9–15 appear on device too.
+SONG_ROW_LABELS: tuple[str | None, ...] = (
+    None,  # 0: pattern name
+    "INTRO",
+    "VERSE",
+    "BRIDGE",
+    "CHORUS",
+    "BREAK",
+    "FILL",
+    "PRE",
+    "CH2",
+    "BUILD",
+    "DROP",
+    "HOOK",
+    "RISE",
+    "SOLO",
+    "THEME",
+    "OUTRO",
+)
+PATTERN_SLOTS = 128
+PATTERN_BASE = 0x200
+PATTERN_STRIDE = 0x15C00  # SPEC.md §2
+PATTERN_NAME_OFF = 0x15AA4  # 40-byte master; first 16 bytes are the name
+PATTERN_NAME_LEN = 16
 
 PAYLOAD_HEAD_MAGIC = bytes.fromhex("ac11d303")
 PAYLOAD_TAIL_MAGIC = bytes.fromhex("aaa1daaa")
@@ -155,24 +194,9 @@ def patch_project_name(raw: bytes, new_name: str) -> tuple[bytes, str, str]:
     return bytes(patched), cleaned, old
 
 
-def _crc32_table() -> tuple[int, ...]:
-    tbl: list[int] = []
-    for i in range(256):
-        c = i
-        for _ in range(8):
-            c = (c >> 1) ^ 0xEDB88320 if c & 1 else c >> 1
-        tbl.append(c)
-    return tuple(tbl)
-
-
-_CRC32_TABLE = _crc32_table()
-
-
 def payload_crc32(data: bytes) -> int:
-    crc = 0
-    for b in data:
-        crc = _CRC32_TABLE[(crc ^ b) & 0xFF] ^ (crc >> 8)
-    return (~crc) & 0xFFFFFFFF
+    """IEEE 802.3 CRC-32 (seed 0xFFFFFFFF) over the compressed stream."""
+    return zlib.crc32(data) & 0xFFFFFFFF
 
 
 # --- LZ4 (raw blocks, 32 KiB, linked on decompress) ---
@@ -415,36 +439,280 @@ def song_table_off(raw: bytes) -> int:
         die("uncompressed project too short to hold 16 songs")
     if raw[-4:] != MAGIC_TAIL:
         die("uncompressed project does not end with bacef00c")
-    off = len(raw) - SONG_TABLE_LEN
-    if off < 0:
-        die("uncompressed project too short for song table")
-    return off
+    # Songs sit immediately before the 4-byte 0xBACEF00C terminator.
+    return len(raw) - SONG_TABLE_LEN - 4
 
 
 def song_name(rec: bytes) -> str:
-    field = rec[:SONG_NAME_LEN]
+    field = rec[SONG_NAME_OFF : SONG_NAME_OFF + SONG_NAME_LEN]
+    return decode_name_field(field) or "EMPTY"
+
+
+def pattern_label(idx: int) -> str:
+    if not 0 <= idx <= 127:
+        return f"?{idx}"
+    return f"{chr(ord('A') + idx // 16)}{(idx % 16) + 1:02d}"
+
+
+def decode_name_field(field: bytes) -> str:
     n = field.find(b"\x00")
     raw = field if n < 0 else field[:n]
-    name = raw.decode("latin-1", errors="replace").strip()
-    return name or "EMPTY"
+    return raw.decode("latin-1", errors="replace").strip()
+
+
+def pattern_name_at(raw: bytes, idx: int) -> str:
+    if not 0 <= idx < PATTERN_SLOTS:
+        return ""
+    off = PATTERN_BASE + idx * PATTERN_STRIDE + PATTERN_NAME_OFF
+    if off + PATTERN_NAME_LEN > len(raw):
+        return ""
+    return decode_name_field(raw[off : off + PATTERN_NAME_LEN])
+
+
+def collect_pattern_names(raw: bytes) -> list[str]:
+    return [pattern_name_at(raw, i) for i in range(PATTERN_SLOTS)]
+
+
+def row_label(label_idx: int, saved_pattern_name: str) -> str:
+    """What Digitakt shows in the LABEL column."""
+    if label_idx == 0:
+        return saved_pattern_name
+    if 0 < label_idx < len(SONG_ROW_LABELS):
+        name = SONG_ROW_LABELS[label_idx]
+        if name:
+            return name
+    return f"L{label_idx}"
+
+
+def format_bpm(raw: int) -> str:
+    if raw == 0:
+        return "inherit"
+    bpm = raw / BPM_SCALE
+    if abs(bpm - round(bpm)) < 1e-6:
+        return str(int(round(bpm)))
+    return f"{bpm:.2f}"
+
+
+def song_row_count(rec: bytes) -> int:
+    """Active rows: u16be at +0x0B4B, else scan until an all-zero 29-byte row."""
+    n = 0
+    if len(rec) >= SONG_ROW_COUNT_OFF + 2:
+        n = struct.unpack_from(">H", rec, SONG_ROW_COUNT_OFF)[0]
+        if n > SONG_ROW_MAX:
+            n = 0
+    if n:
+        return n
+    for i in range(SONG_ROW_MAX):
+        off = SONG_ROW_OFF + i * SONG_ROW_SIZE
+        if off + SONG_ROW_SIZE > len(rec):
+            return i
+        if rec[off : off + SONG_ROW_SIZE] == bytes(SONG_ROW_SIZE):
+            return i
+    return SONG_ROW_MAX
+
+
+def parse_song_row(row: bytes, pattern_names: list[str] | None = None) -> dict:
+    # Byte 7 = tracks 1–8 (bit 0 = T1), byte 8 = tracks 9–16.
+    mute = row[7] | (row[8] << 8)
+    length = struct.unpack_from(">H", row, 9)[0]
+    if length > 1024:
+        swapped = struct.unpack_from("<H", row, 9)[0]
+        if 1 <= swapped <= 1024:
+            length = swapped
+    pat = row[0]
+    slot = pattern_label(pat)
+    saved = ""
+    if pattern_names and 0 <= pat < len(pattern_names):
+        saved = pattern_names[pat]
+    idx = row[1]
+    return {
+        "pattern": pat,
+        "pattern_name": slot,
+        "label_idx": idx,
+        "label": row_label(idx, saved),
+        "repeat": row[2],
+        "bpm_raw": struct.unpack_from(">I", row, 3)[0],
+        "mute": mute,
+        "length": length,
+    }
+
+
+def parse_song(rec: bytes, pattern_names: list[str] | None = None) -> dict:
+    n = song_row_count(rec)
+    rows = []
+    for i in range(n):
+        off = SONG_ROW_OFF + i * SONG_ROW_SIZE
+        if off + SONG_ROW_SIZE > len(rec):
+            break
+        rows.append(parse_song_row(rec[off : off + SONG_ROW_SIZE], pattern_names))
+    default_bpm = None
+    if len(rec) >= SONG_TEMPO_OFF + 2:
+        raw = struct.unpack_from(">H", rec, SONG_TEMPO_OFF)[0]
+        if raw % BPM_SCALE == 0:
+            bpm = raw // BPM_SCALE
+            if 30 <= bpm <= 300:
+                default_bpm = bpm
+    return {
+        "name": song_name(rec),
+        "rows": rows,
+        "default_bpm": default_bpm,
+    }
+
+
+def mute_pads_html(mute: int) -> str:
+    """Digitakt-style 2×8 trig pads: upper 9–16, lower 1–8."""
+
+    def pad(t: int) -> str:
+        muted = bool(mute & (1 << (t - 1)))
+        state = "muted" if muted else "live"
+        label = "muted" if muted else "live"
+        return f'<span class="pad {state}" title="T{t} {label}">{t}</span>'
+
+    upper = "".join(pad(t) for t in range(9, 17))
+    lower = "".join(pad(t) for t in range(1, 9))
+    return (
+        '<td class="mutes"><div class="pads">'
+        f'<div class="pad-row">{upper}</div>'
+        f'<div class="pad-row">{lower}</div>'
+        "</div></td>"
+    )
+
+
+def render_songs_html(
+    title: str,
+    slots: list[bytes],
+    pattern_names: list[str] | None = None,
+) -> str:
+    """Self-contained setlist page: pattern, repeats, BPM, length, mute map."""
+    parsed = [parse_song(rec, pattern_names) for rec in slots]
+    toc = []
+    sections = []
+    for i, song in enumerate(parsed):
+        name = song["name"]
+        empty = name == "EMPTY" and not song["rows"]
+        n_rows = len(song["rows"])
+        cls = " empty" if empty else ""
+        toc.append(
+            f'<a href="#s{i:02d}" class="toc-item{cls}">'
+            f"<span class='slot'>{i:02d}</span>"
+            f"<span class='nm'>{escape(name)}</span>"
+            f"<span class='n'>{n_rows}</span></a>"
+        )
+        meta = [f"{n_rows} row{'s' if n_rows != 1 else ''}"]
+        if song["default_bpm"] is not None:
+            meta.append(f"{song['default_bpm']} BPM")
+        body = []
+        if not song["rows"]:
+            body.append('<p class="empty-msg">No rows</p>')
+        else:
+            body.append(
+                "<table><thead><tr>"
+                "<th>#</th><th>Label</th><th>Pattern</th><th>Repeat</th>"
+                "<th>BPM</th><th>Length</th>"
+                "<th class='m-label'>Mute</th></tr></thead><tbody>"
+            )
+            for r_i, row in enumerate(song["rows"], start=1):
+                lab = row["label"]
+                lab_cls = "lab kw" if row["label_idx"] else "lab ptn"
+                lab_html = escape(lab) if lab else "—"
+                body.append(
+                    "<tr>"
+                    f"<td class='idx'>{r_i}</td>"
+                    f"<td class='{lab_cls}' title='LABEL {row['label_idx']}'>"
+                    f"{lab_html}</td>"
+                    f"<td class='pat'>{escape(row['pattern_name'])}</td>"
+                    f"<td class='rep'>×{row['repeat']}</td>"
+                    f"<td class='bpm'>{escape(format_bpm(row['bpm_raw']))}</td>"
+                    f"<td class='len'>{row['length']}</td>"
+                    f"{mute_pads_html(row['mute'])}</tr>"
+                )
+            body.append("</tbody></table>")
+        sections.append(
+            f'<section id="s{i:02d}" class="song{cls}">'
+            f"<h2><span class='slot'>{i:02d}</span> {escape(name)} "
+            f"<span class='meta'>{escape(' · '.join(meta))}</span></h2>"
+            f"{''.join(body)}</section>"
+        )
+
+    css = """
+:root { color-scheme: dark; }
+* { box-sizing: border-box; }
+body {
+  margin: 0; padding: 24px 28px 48px;
+  font: 13px/1.4 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  background: #141414; color: #e6e6e6;
+}
+h1 { font-size: 16px; font-weight: 650; margin: 0 0 6px; }
+.sub { color: #8c8c8c; margin: 0 0 18px; }
+nav.toc {
+  display: grid; grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
+  gap: 6px; margin: 0 0 28px;
+}
+.toc-item {
+  display: flex; gap: 8px; align-items: baseline;
+  padding: 6px 8px; border: 1px solid #2c2c2c; border-radius: 4px;
+  color: inherit; text-decoration: none; background: #1a1a1a;
+}
+.toc-item:hover { border-color: #4a4a4a; }
+.toc-item.empty { opacity: 0.45; }
+.toc-item .slot, h2 .slot {
+  color: #8c8c8c; font-variant-numeric: tabular-nums;
+}
+.toc-item .nm { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.toc-item .n { color: #6e6e6e; }
+section.song {
+  margin: 0 0 22px; padding: 14px 16px 16px;
+  background: #1b1b1b; border: 1px solid #2a2a2a; border-radius: 6px;
+}
+section.song.empty { opacity: 0.55; }
+h2 { font-size: 14px; font-weight: 650; margin: 0 0 10px; }
+h2 .meta { color: #8c8c8c; font-weight: 500; font-size: 12px; }
+.empty-msg { color: #8c8c8c; margin: 0; }
+table { border-collapse: collapse; width: max-content; max-width: 100%; }
+th, td { padding: 3px 8px; text-align: left; white-space: nowrap; }
+th { color: #8c8c8c; font-weight: 500; font-size: 11px; }
+td.idx { color: #6e6e6e; font-variant-numeric: tabular-nums; vertical-align: middle; }
+td.lab { vertical-align: middle; min-width: 5em; }
+td.lab.kw { font-weight: 650; color: #e6e6e6; }
+td.lab.ptn { color: #8c8c8c; }
+td.pat { font-weight: 650; vertical-align: middle; }
+td.rep, td.bpm, td.len { vertical-align: middle; }
+td.mutes { padding: 6px 8px; }
+.pads { display: flex; flex-direction: column; gap: 3px; }
+.pad-row { display: flex; gap: 3px; }
+.pad {
+  width: 22px; height: 22px; border-radius: 3px;
+  display: flex; align-items: center; justify-content: center;
+  font-size: 10px; font-weight: 650; font-variant-numeric: tabular-nums;
+}
+.pad.live { background: #d4652f; color: #1a0c06; }
+.pad.muted { background: #2a2a2a; color: #5a5a5a; }
+th.m-label { color: #8c8c8c; font-weight: 500; }
+tbody tr:hover td:not(.mutes) { background: #222; }
+""".strip()
+
+    return (
+        "<!DOCTYPE html>\n<html lang='en'><head><meta charset='utf-8'>"
+        f"<title>{escape(title)} songs</title>"
+        f"<style>{css}</style></head><body>"
+        f"<h1>{escape(title)}</h1>"
+        "<p class='sub'>16 song slots — LABEL is the song-edit keyword "
+        "(or the pattern name when that is selected). Mute pads: 9–16 over 1–8; "
+        "lit = playing, dark = muted.</p>"
+        f"<nav class='toc'>{''.join(toc)}</nav>"
+        f"{''.join(sections)}</body></html>\n"
+    )
 
 
 def empty_song_template(raw: bytes, start: int) -> bytes:
-    """Blank 3072-byte slot copied from this project, without the file-tail magic."""
-    blank = None
+    """Blank 3072-byte slot copied from this project's first EMPTY slot."""
     for i in range(SONG_SLOTS):
-        rec = bytearray(raw[start + i * SONG_SIZE : start + (i + 1) * SONG_SIZE])
-        if song_name(bytes(rec)) != "EMPTY":
-            continue
-        if rec[-4:] == MAGIC_TAIL:
-            rec[-4:] = b"\x00\x00\x00\x00"
-        blank = bytes(rec)
-        break
-    if blank is None:
-        rec = bytearray(SONG_SIZE)
-        rec[2892:2894] = b"\x38\x40"  # default leftover in factory-empty slots
-        blank = bytes(rec)
-    return blank
+        rec = raw[start + i * SONG_SIZE : start + (i + 1) * SONG_SIZE]
+        if song_name(rec) == "EMPTY":
+            return rec
+    rec = bytearray(SONG_SIZE)
+    rec[SONG_TEMPO_OFF : SONG_TEMPO_OFF + 2] = b"\x38\x40"  # 120 BPM leftover in factory-empty slots
+    return bytes(rec)
 
 
 def sanitize(name: str) -> str:
@@ -470,15 +738,23 @@ def dump_songs(prj: Path) -> Path:
     for p in outdir.glob("*.bin"):
         p.unlink()
     used = 0
+    slots: list[bytes] = []
     for i in range(SONG_SLOTS):
         rec = raw[start + i * SONG_SIZE : start + (i + 1) * SONG_SIZE]
+        slots.append(rec)
         name = song_name(rec)
         if name != "EMPTY":
             used += 1
         path = outdir / f"{i:02d}_{sanitize(name)}.bin"
         path.write_bytes(rec)
         print(f"dump  {path.name:40s}  {len(rec):5d} bytes  {name}")
+    html_path = outdir / "songs.html"
+    html_path.write_text(
+        render_songs_html(prj.stem, slots, collect_pattern_names(raw)),
+        encoding="utf-8",
+    )
     print(f"wrote {SONG_SLOTS} slots ({used} named) to {outdir}")
+    print(f"wrote {html_path}")
     print(f"uncompressed project {len(raw)} bytes; each slot is {SONG_SIZE} bytes")
     return outdir
 
@@ -532,7 +808,6 @@ def restore_songs(prj: Path, folder: Path, new_name: str | None = None) -> None:
         patched[off : off + SONG_SIZE] = blob
         print(f"  slot {idx:02d}  ←  {path.name}  {song_name(blob)}")
 
-    patched[-4:] = MAGIC_TAIL
     new_raw = bytes(patched)
     out_pname: str | None = None
     if new_name is not None:
