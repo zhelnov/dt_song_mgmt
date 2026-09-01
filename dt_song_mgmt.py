@@ -58,26 +58,22 @@ SONG_ROW_COUNT_OFF = 0x0B4B  # u16be active row count (SPEC.md §8)
 SONG_TEMPO_OFF = 0x0B50  # u16be leftover / default tempo (raw = BPM * 120)
 SONG_TRACKS = 16
 BPM_SCALE = 120  # raw = BPM * 120
-# Song-edit LABEL (row byte 1). 0 = pattern name (16 bytes at pattern+0x15AA4).
-# 1–8 are the factory song-edit keywords (manual screenshot: INTRO, VERSE,
-# BRIDGE, CHORUS, then BREAK, FILL, PRE, CH2). 9–15 appear on device too.
+# Row byte 1 = Tag ID (SPEC.md §9: +0x01 on disk).
+#   1 = (PTN NAME): 16-byte custom name at pattern config +0x00, else A01
+#   2.. = static keywords from Digitakt II MAIN OS (Song::updateMirror table)
 SONG_ROW_LABELS: tuple[str | None, ...] = (
-    None,  # 0: pattern name
+    None,  # 0: unused
+    None,  # 1: (PTN NAME) — resolved from the pattern
     "INTRO",
-    "VERSE",
-    "BRIDGE",
-    "CHORUS",
-    "BREAK",
-    "FILL",
-    "PRE",
-    "CH2",
-    "BUILD",
-    "DROP",
-    "HOOK",
-    "RISE",
-    "SOLO",
-    "THEME",
     "OUTRO",
+    "CHORUS",
+    "SOLO",
+    "FILL",
+    "PEAK",
+    "JAM",
+    "NOISE",
+    "MISC",
+    "PAUSE",
 )
 PATTERN_SLOTS = 128
 PATTERN_BASE = 0x200
@@ -457,7 +453,7 @@ def pattern_label(idx: int) -> str:
 def decode_name_field(field: bytes) -> str:
     n = field.find(b"\x00")
     raw = field if n < 0 else field[:n]
-    return raw.decode("latin-1", errors="replace").strip()
+    return raw.decode("cp1252", errors="replace").strip()
 
 
 def pattern_name_at(raw: bytes, idx: int) -> str:
@@ -473,15 +469,24 @@ def collect_pattern_names(raw: bytes) -> list[str]:
     return [pattern_name_at(raw, i) for i in range(PATTERN_SLOTS)]
 
 
-def row_label(label_idx: int, saved_pattern_name: str) -> str:
-    """What Digitakt shows in the LABEL column."""
-    if label_idx == 0:
-        return saved_pattern_name
-    if 0 < label_idx < len(SONG_ROW_LABELS):
-        name = SONG_ROW_LABELS[label_idx]
+def row_label(tag_id: int, pattern_idx: int, saved_pattern_name: str) -> str:
+    """What Digitakt shows in the LABEL column (SPEC.md §9)."""
+    if tag_id == 1:
+        return saved_pattern_name or pattern_label(pattern_idx)
+    if 0 <= tag_id < len(SONG_ROW_LABELS):
+        name = SONG_ROW_LABELS[tag_id]
         if name:
             return name
-    return f"L{label_idx}"
+    if tag_id == 0:
+        return ""
+    return f"T{tag_id}"
+
+
+def format_length(length: int) -> str:
+    """Row length: 1000–1024 display as K00–K24 on the device."""
+    if 1000 <= length <= 1024:
+        return f"K{length - 1000:02d}"
+    return str(length)
 
 
 def format_bpm(raw: int) -> str:
@@ -524,12 +529,12 @@ def parse_song_row(row: bytes, pattern_names: list[str] | None = None) -> dict:
     saved = ""
     if pattern_names and 0 <= pat < len(pattern_names):
         saved = pattern_names[pat]
-    idx = row[1]
+    tag_id = row[1]
     return {
         "pattern": pat,
         "pattern_name": slot,
-        "label_idx": idx,
-        "label": row_label(idx, saved),
+        "label_idx": tag_id,
+        "label": row_label(tag_id, pat, saved),
         "repeat": row[2],
         "bpm_raw": struct.unpack_from(">I", row, 3)[0],
         "mute": mute,
@@ -607,23 +612,18 @@ def render_songs_html(
         else:
             body.append(
                 "<table><thead><tr>"
-                "<th>#</th><th>Label</th><th>Pattern</th><th>Repeat</th>"
+                "<th>#</th><th>Pattern</th><th>Repeat</th>"
                 "<th>BPM</th><th>Length</th>"
                 "<th class='m-label'>Mute</th></tr></thead><tbody>"
             )
             for r_i, row in enumerate(song["rows"], start=1):
-                lab = row["label"]
-                lab_cls = "lab kw" if row["label_idx"] else "lab ptn"
-                lab_html = escape(lab) if lab else "—"
                 body.append(
                     "<tr>"
                     f"<td class='idx'>{r_i}</td>"
-                    f"<td class='{lab_cls}' title='LABEL {row['label_idx']}'>"
-                    f"{lab_html}</td>"
                     f"<td class='pat'>{escape(row['pattern_name'])}</td>"
                     f"<td class='rep'>×{row['repeat']}</td>"
                     f"<td class='bpm'>{escape(format_bpm(row['bpm_raw']))}</td>"
-                    f"<td class='len'>{row['length']}</td>"
+                    f"<td class='len'>{escape(format_length(row['length']))}</td>"
                     f"{mute_pads_html(row['mute'])}</tr>"
                 )
             body.append("</tbody></table>")
@@ -672,9 +672,6 @@ table { border-collapse: collapse; width: max-content; max-width: 100%; }
 th, td { padding: 3px 8px; text-align: left; white-space: nowrap; }
 th { color: #8c8c8c; font-weight: 500; font-size: 11px; }
 td.idx { color: #6e6e6e; font-variant-numeric: tabular-nums; vertical-align: middle; }
-td.lab { vertical-align: middle; min-width: 5em; }
-td.lab.kw { font-weight: 650; color: #e6e6e6; }
-td.lab.ptn { color: #8c8c8c; }
 td.pat { font-weight: 650; vertical-align: middle; }
 td.rep, td.bpm, td.len { vertical-align: middle; }
 td.mutes { padding: 6px 8px; }
@@ -696,9 +693,8 @@ tbody tr:hover td:not(.mutes) { background: #222; }
         f"<title>{escape(title)} songs</title>"
         f"<style>{css}</style></head><body>"
         f"<h1>{escape(title)}</h1>"
-        "<p class='sub'>16 song slots — LABEL is the song-edit keyword "
-        "(or the pattern name when that is selected). Mute pads: 9–16 over 1–8; "
-        "lit = playing, dark = muted.</p>"
+        "<p class='sub'>16 song slots — pattern, repeats, BPM, length, mute pads "
+        "(9–16 over 1–8; lit = playing, dark = muted).</p>"
         f"<nav class='toc'>{''.join(toc)}</nav>"
         f"{''.join(sections)}</body></html>\n"
     )

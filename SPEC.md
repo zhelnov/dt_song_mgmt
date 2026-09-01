@@ -212,3 +212,79 @@ Located at pat_base + 0x15AD4 (DN2) / pat_base + 0x15AA4 (DT2):
   - Byte 3..6: 32-bit BPM Override (raw = BPM \* 120, 0 = Inherit pattern BPM)
   - Byte 7..8: 16-Track Mute Bitmask (Bit 0..15 = Track 1..16 Muted)
   - Byte 9..10: Row Step Length (1..1024 steps)
+
+---
+
+## 9. Pattern Custom Names (Tag 1 / PTN NAME)
+
+**exact functions, offsets, and data structures** responsible for resolving Tag `1` (`(PTN NAME)`).
+
+### 9.1 Grounded Execution Trace of Dynamic Tag 1
+
+In `FUN_4007e970` (Playlist Row Drawer) and `FUN_40081192` (Cue Row Drawer):
+
+```
+// 1. Read Row Tag ID and Pattern Index
+uVar8  = FUN_40049a26(song, row_idx);   // Tag ID from Row (+0x01 on disk / +0x18 in RAM)
+uVar11 = FUN_40049716(song, row_idx);   // Pattern Index from Row (+0x00 on disk / +0x10 in RAM)
+
+// 2. Fetch the Pattern object for that pattern index
+uVar2 = FUN_4003dcc6(proj, uVar11); // Pattern Object (Stride: 0x954 RAM / 0x15C00 Container)
+uVar2 = FUN_4003ac2c(uVar2); // PatternSettings sub-object (+0x2C in RAM)
+
+// 3. If Tag ID == 1: Resolve the dynamic pattern name!
+if (uVar8 == 1) {
+    FUN_4003a976(uVar2); // Reads 16-byte custom pattern name string
+    // Truncates to fit UI column (6-9 chars)
+} else {
+    // Look up static enum in table (Tags 2..20)
+    label = (&PTR_DAT_40272d14)[uVar8];
+}
+```
+
+### 9.2 Exact Memory Offsets for Pattern Custom Names
+
+In `FUN_40039b82`, `PatternSettings` is unpacked directly from the Pattern Config Block at the end of each pattern slice:
+
+#### Digitone II (.dn2prj)
+
+- **Pattern Base**: `PATTERN_1_BASE + (pat_idx * 0x15C00)` (where `PATTERN_1_BASE = 512`)
+- **Pattern Config Offset**: `pat_base + 0x15AD4`
+- **Custom Pattern Name String Buffer**: `pat_base + 0x15AD4 + 0x00` through `+0x0F` (16 bytes ASCII)
+- **Pattern Config Structure**:
+  - `+0x00 .. +0x0F`: **16-Byte Custom Pattern Name** (null-terminated ASCII)
+  - `+0x10 .. +0x11`: Kit Index (`uint16_be`)
+  - `+0x12 .. +0x13`: Pattern BPM (`uint16_be`)
+  - `+0x14 .. +0x15`: Pattern Step Length (`uint16_be`)
+  - `+0x18`: Scale Mode / Swing
+
+#### Digitakt II (.dt2prj)
+
+- **Pattern Base**: `OFFSET_PATTERNS_BASE + (pat_idx * 0x15C00)` (where `OFFSET_PATTERNS_BASE = 512`)
+- **Pattern Config Offset**: `pat_base + 0x15AA4`
+- **Custom Pattern Name String Buffer**: `pat_base + 0x15AA4 + 0x00` through `+0x0F` (16 bytes ASCII)
+- **Pattern Config Structure**:
+  - `+0x00 .. +0x0F`: **16-Byte Custom Pattern Name** (null-terminated ASCII)
+  - `+0x10 .. +0x11`: Kit Index (`uint16_be`)
+  - `+0x12 .. +0x13`: Pattern BPM (`uint16_be`)
+  - `+0x14 .. +0x15`: Pattern Step Length (`uint16_be`)
+  - `+0x18`: Scale Mode / Swing
+
+### 9.3 Resolution Logic for Tag 1
+
+```
+def get_pattern_name(self, pattern_idx: int) -> str:
+    pat_base = self._pattern_base(pattern_idx)
+    cfg_offset = pat_base + PATTERN_CONFIG_OFFSET  # 0x15AD4 on DN2, 0x15AA4 on DT2
+    raw_name = self.ram[cfg_offset : cfg_offset + 16].decode("cp1252", errors="ignore").split("\x00")[0].strip()
+    if raw_name:
+        return raw_name  # Fallback to standard Pattern Bank/Number if unnamed
+    bank_letter = chr(ord('A') + (pattern_idx // 16))
+    pat_num = (pattern_idx % 16) + 1
+    return f"{bank_letter}{pat_num:02d}"
+```
+
+When a Song Row has `tag_id == 1`:
+
+1. If the user assigned a custom name to that pattern (e.g. `"INTRO BEAT"` at `pat_base + CONFIG + 0x00`), Tag `1` displays `"INTRO BEAT"`.
+2. If the pattern name is blank/unassigned, Tag `1` displays the pattern coordinate (e.g. `"A01"`).

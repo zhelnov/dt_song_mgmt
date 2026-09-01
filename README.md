@@ -30,3 +30,7 @@ python ./dt_song_mgmt.py project.dt2prj ./SONGS_<stem> NEW_NAME
 `NEW_NAME` is the project name stored in the `.dt2prj` payload, not just the file or folder name.
 
 Files are matched by the `NN_` slot prefix (`00`–`15`). Missing slots are cleared to empty songs — the folder is treated as the full 16-slot setlist.
+
+## TODO
+
+- **Song row labels** — Digitakt LABEL (`INTRO`, `VERSE`, pattern name, …) is still not mapped correctly from the 29-byte row. Hidden in `songs.html` until the tag/byte mapping matches the device.
