@@ -30,7 +30,7 @@ Elektron Digitone II (.dn2prj) & Digitakt II (.dt2prj)
   - 0x1D (Byte 29): 0x01 (Compressed LZ4 payload) or 0x00 (Raw uncompressed image)
 - Compression Engine: Continuous 32,768-byte blocks with a 65,536-byte sliding history dictionary (FUN_401321f0)
 - Footer Size: 12 bytes (0x0C) (FUN_400e96e0)
-  - 0x00..0x03: IEEE 802.3 CRC-32 (computed over compressed stream with seed 0xFFFFFFFF)
+  - 0x00..0x03: CRC-32 over the compressed stream (length prefixes + LZ4 blocks + 4-byte null terminator). Reflected poly 0xEDB88320, init 0, xorout 0xFFFFFFFF. Not zlib.crc32(data), which seeds the register with 0xFFFFFFFF.
   - 0x04..0x07: Total compressed stream length (Big-Endian uint32)
   - 0x08..0x0B: Footer Magic 0xAA A1 DA AA
 

@@ -191,8 +191,14 @@ def patch_project_name(raw: bytes, new_name: str) -> tuple[bytes, str, str]:
 
 
 def payload_crc32(data: bytes) -> int:
-    """IEEE 802.3 CRC-32 (seed 0xFFFFFFFF) over the compressed stream."""
-    return zlib.crc32(data) & 0xFFFFFFFF
+    """CRC-32 of the compressed stream (chunk lengths, LZ4 blocks, null terminator).
+
+    Reflected poly 0xEDB88320, register init 0, xorout 0xFFFFFFFF.
+    zlib.crc32(data) seeds the register with 0xFFFFFFFF and Transfer rejects
+    that footer as "payload has incorrect checksum". Passing 0xFFFFFFFF as the
+    zlib starting value cancels that seed, leaving init 0.
+    """
+    return zlib.crc32(data, 0xFFFFFFFF) & 0xFFFFFFFF
 
 
 # --- LZ4 (raw blocks, 32 KiB, linked on decompress) ---
